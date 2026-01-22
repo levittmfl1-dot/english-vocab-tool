@@ -75,6 +75,7 @@ st.markdown("""
 # 2. 数据库管理
 # ==========================================
 def init_db():
+    # 加上 check_same_thread=False 防止多线程报错
     conn = sqlite3.connect('vocab.db', check_same_thread=False)
     c = conn.cursor()
     # 单词表
@@ -93,6 +94,7 @@ def init_db():
 def get_db_connection():
     return sqlite3.connect('vocab.db', check_same_thread=False)
 
+# 初始化数据库
 init_db()
 
 # ==========================================
@@ -145,7 +147,7 @@ def check_sentence(word, sentence, context_info):
     User Sentence: "{sentence}"
     
     Task:
-    1. Check if the word is used correctly in context.
+    1. Check if the user used the word correctly in context.
     2. Fix grammar errors.
     3. Suggest a more native/natural version.
     
@@ -289,6 +291,60 @@ elif menu == "✍️ Practice":
         elif not client:
             st.error("No API Key found.")
         else:
-            # Check if word exists in DB to give better context
             conn = get_db_connection()
-            row = pd.read_sql("SELECT * FROM words WHERE word = ?", co
+            # 修复：防止代码太长被截断，拆开写
+            query_sql = "SELECT * FROM words WHERE word = ?"
+            row = pd.read_sql(query_sql, conn, params=(target_word,))
+            conn.close()
+            
+            word_context = "General English Word"
+            if not row.empty:
+                word_context = f"{row.iloc[0]['def_en']} ({row.iloc[0]['def_cn']})"
+            
+            with st.spinner("AI Teacher is correcting..."):
+                res = check_sentence(target_word, user_sent, word_context)
+                if res:
+                    st.divider()
+                    if res['status'] == "Perfect":
+                        st.success(f"🎉 {res['status']}!")
+                    else:
+                        st.info(f"📊 Status: {res['status']}")
+                    
+                    st.write(f"**Your Sentence:** {user_sent}")
+                    st.write(f"**Corrected:** {res['corrected']}")
+                    st.write(f"**Native Way:** {res['native_suggestion']}")
+                    st.caption(f"💡 Feedback: {res['feedback']}")
+                    
+                    # Save to history
+                    conn = get_db_connection()
+                    conn.execute("INSERT INTO history (target_word, user_sentence, correction, feedback, status) VALUES (?, ?, ?, ?, ?)",
+                                 (target_word, user_sent, res['corrected'], res['feedback'], res['status']))
+                    conn.commit()
+                    conn.close()
+
+# --- 页面 4: 管理列表 (删除功能) ---
+elif menu == "⚙️ Manage List":
+    st.header("Manage Vocabulary")
+    
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT id, word, def_cn, created_at FROM words ORDER BY created_at DESC", conn)
+    conn.close()
+    
+    if not df.empty:
+        for index, row in df.iterrows():
+            col1, col2, col3, col4 = st.columns([2, 3, 2, 1])
+            with col1:
+                st.write(f"**{row['word']}**")
+            with col2:
+                st.write(row['def_cn'])
+            with col3:
+                st.caption(row['created_at'])
+            with col4:
+                if st.button("🗑️", key=f"del_{row['id']}"):
+                    conn = get_db_connection()
+                    conn.execute("DELETE FROM words WHERE id = ?", (row['id'],))
+                    conn.commit()
+                    conn.close()
+                    st.rerun()
+    else:
+        st.write("No words found.")
