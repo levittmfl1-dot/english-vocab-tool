@@ -1,166 +1,294 @@
-import React, { useState, useEffect } from 'react';
-import { Loader2, Send, Check, X, Sparkles, MessageSquare, AlertTriangle } from 'lucide-react';
-import { storageService } from '../services/storageService';
-import { geminiService } from '../services/geminiService';
-import { Word, PracticeSession } from '../types';
+import streamlit as st
+import sqlite3
+import pandas as pd
+from openai import OpenAI
+import json
+import random
 
-interface PracticeProps {
-  apiKey: string;
+# ==========================================
+# 1. 基础配置与 CSS 样式 (3D 翻转卡片)
+# ==========================================
+st.set_page_config(page_title="AI Vocab Master", layout="wide")
+
+# CSS for Flashcard Flip Animation
+st.markdown("""
+<style>
+.flip-card {
+  background-color: transparent;
+  width: 100%;
+  height: 300px;
+  perspective: 1000px;
+  margin-bottom: 20px;
 }
 
-const Practice: React.FC<PracticeProps> = ({ apiKey }) => {
-  const [words, setWords] = useState<Word[]>([]);
-  const [targetWordInput, setTargetWordInput] = useState('');
-  const [sentence, setSentence] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [result, setResult] = useState<PracticeSession | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
+.flip-card-inner {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  text-align: center;
+  transition: transform 0.6s;
+  transform-style: preserve-3d;
+  box-shadow: 0 4px 8px 0 rgba(0,0,0,0.2);
+  border-radius: 15px;
+}
 
-  useEffect(() => {
-    setWords(storageService.getWords());
-  }, []);
+.flip-card-front, .flip-card-back {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border-radius: 15px;
+  padding: 20px;
+}
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!targetWordInput.trim() || !sentence.trim()) return;
-    if (!apiKey) {
-        setError("Please set your API Key first.");
-        return;
-    }
+.flip-card-front {
+  background-color: #f1f1f1;
+  color: black;
+  border: 2px solid #ddd;
+}
 
-    setIsLoading(true);
-    setResult(null);
-    setError(null);
-    setWarning(null);
+.flip-card-back {
+  background-color: #e3f2fd;
+  color: black;
+  transform: rotateY(180deg);
+  border: 2px solid #90caf9;
+  overflow-y: auto;
+}
 
-    try {
-      // Validation Logic
-      const matchedWord = words.find(w => w.term.toLowerCase() === targetWordInput.trim().toLowerCase());
-      
-      if (!matchedWord) {
-        setWarning("Word not found in your vocabulary list. AI will check grammar generally.");
-      }
+.flipped {
+  transform: rotateY(180deg);
+}
 
-      const correction = await geminiService.correctSentence(apiKey, targetWordInput, sentence);
-      
-      const session: PracticeSession = {
-        id: crypto.randomUUID(),
-        wordId: matchedWord ? matchedWord.id : 'unknown',
-        wordTerm: targetWordInput,
-        userSentence: sentence,
-        correctedSentence: correction.corrected_sentence,
-        betterVersion: correction.better_version,
-        feedback: correction.feedback,
-        isCorrect: correction.is_correct,
-        createdAt: Date.now(),
-      };
+.word-text { font-size: 32px; font-weight: bold; color: #333; }
+.def-text { font-size: 18px; margin-top: 10px; }
+.cn-text { font-size: 20px; color: #555; font-weight: bold; margin-top: 5px;}
+.context-text { font-size: 14px; color: #d81b60; font-style: italic; margin-top: 15px; border-top: 1px dashed #ccc; padding-top: 5px;}
+</style>
+""", unsafe_allow_html=True)
 
-      // Only save to history if it was a real word? Or always? Prompt implies history log is needed.
-      storageService.addPracticeSession(session);
-      setResult(session);
-    } catch (err: any) {
-      setError(err.message || "Failed to analyze sentence.");
-    } finally {
-      setIsLoading(false);
-    }
-  };
+# ==========================================
+# 2. 数据库管理
+# ==========================================
+def init_db():
+    conn = sqlite3.connect('vocab.db', check_same_thread=False)
+    c = conn.cursor()
+    # 单词表
+    c.execute('''CREATE TABLE IF NOT EXISTS words
+                 (id INTEGER PRIMARY KEY, word TEXT UNIQUE, 
+                  def_en TEXT, def_cn TEXT, ipa TEXT, 
+                  sample_sentence TEXT, source_context TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    # 历史记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS history
+                 (id INTEGER PRIMARY KEY, target_word TEXT, 
+                  user_sentence TEXT, correction TEXT, feedback TEXT, status TEXT, 
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
 
-  return (
-    <div className="max-w-3xl mx-auto space-y-8">
-      <div className="text-center mb-8">
-        <h2 className="text-3xl font-bold text-slate-800">Sentence Practice</h2>
-        <p className="text-slate-500">Master your vocabulary by using it in context.</p>
-      </div>
+def get_db_connection():
+    return sqlite3.connect('vocab.db', check_same_thread=False)
 
-      <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-        <form onSubmit={handleSubmit} className="space-y-6">
-          
-          <div>
-            <label className="block text-sm font-semibold text-slate-700 mb-2">Target Word</label>
-            <input 
-              type="text"
-              value={targetWordInput}
-              onChange={(e) => setTargetWordInput(e.target.value)}
-              placeholder="e.g. Ephemeral"
-              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
-            />
-          </div>
+init_db()
 
-          <div>
-            <label className="block text-sm font-semibold text-slate-700 mb-2">Your Sentence</label>
-            <textarea
-              value={sentence}
-              onChange={(e) => setSentence(e.target.value)}
-              placeholder={`Write a sentence using "${targetWordInput || 'the word'}"...`}
-              className="w-full p-4 h-32 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none resize-none transition-all"
-            />
-          </div>
+# ==========================================
+# 3. AI 逻辑
+# ==========================================
+# 获取 API Key
+api_key = st.secrets.get("OPENAI_API_KEY")
+if not api_key:
+    api_key = st.sidebar.text_input("OpenAI API Key", type="password")
 
-          <button
-            type="submit"
-            disabled={isLoading || !targetWordInput.trim() || !sentence.trim()}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition-colors flex justify-center items-center gap-2"
-          >
-            {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-            Check Sentence
-          </button>
-        </form>
+client = None
+if api_key:
+    client = OpenAI(api_key=api_key)
+
+def generate_word_info(word):
+    if not client: return None
+    prompt = f"""
+    Analyze the English word: "{word}".
+    1. Provide a concise English definition (Cambridge/Oxford style).
+    2. Provide a Chinese definition.
+    3. Provide IPA pronunciation.
+    4. Provide a standard sample sentence.
+    5. CRITICAL: If this word has a specific slang, internet, or social media usage (e.g., "Cap", "Salty", "Ghost"), explain it in 'source_context'. If not, leave it empty.
+    
+    Output JSON format:
+    {{
+        "def_en": "...",
+        "def_cn": "...",
+        "ipa": "...",
+        "sample": "...",
+        "context": "..."
+    }}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        st.error(f"AI Error: {e}")
+        return None
+
+def check_sentence(word, sentence, context_info):
+    if not client: return None
+    prompt = f"""
+    Word: "{word}"
+    Definition: {context_info}
+    User Sentence: "{sentence}"
+    
+    Task:
+    1. Check if the word is used correctly in context.
+    2. Fix grammar errors.
+    3. Suggest a more native/natural version.
+    
+    Output JSON:
+    {{
+        "status": "Perfect" or "Good" or "Incorrect",
+        "corrected": "...",
+        "feedback": "Explain grammar or usage logic briefly.",
+        "native_suggestion": "..."
+    }}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a strict English teacher."},
+                      {"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        st.error(f"AI Error: {e}")
+        return None
+
+# ==========================================
+# 4. 界面逻辑
+# ==========================================
+
+# 侧边栏导航
+menu = st.sidebar.radio("Menu", ["📖 Add Word", "🗂 Flashcards", "✍️ Practice", "⚙️ Manage List"])
+
+# --- 页面 1: 添加单词 ---
+if menu == "📖 Add Word":
+    st.header("Add New Word")
+    new_word = st.text_input("Enter English Word").strip()
+    
+    if st.button("✨ Auto-Generate & Save"):
+        if not new_word:
+            st.warning("Please enter a word.")
+        elif not client:
+            st.error("Please provide OpenAI API Key in Sidebar.")
+        else:
+            with st.spinner(f"Searching Cambridge/Oxford & Internet context for '{new_word}'..."):
+                data = generate_word_info(new_word)
+                if data:
+                    conn = get_db_connection()
+                    try:
+                        conn.execute("INSERT INTO words (word, def_en, def_cn, ipa, sample_sentence, source_context) VALUES (?, ?, ?, ?, ?, ?)",
+                                     (new_word, data['def_en'], data['def_cn'], data['ipa'], data['sample'], data['context']))
+                        conn.commit()
+                        st.success(f"Added: **{new_word}**")
+                        st.json(data)
+                    except sqlite3.IntegrityError:
+                        st.warning("Word already exists in database!")
+                    finally:
+                        conn.close()
+
+# --- 页面 2: 闪卡复习 (3D 动画版) ---
+elif menu == "🗂 Flashcards":
+    st.header("Flashcards Review")
+    
+    mode = st.radio("Select Mode", ["Mode A: Recall (See Word -> Defs)", "Mode B: Challenge (See En Def -> Word)"], horizontal=True)
+    
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM words", conn)
+    conn.close()
+    
+    if df.empty:
+        st.info("No words yet. Go add some!")
+    else:
+        # Session state to track current card index and flip state
+        if 'card_idx' not in st.session_state:
+            st.session_state.card_idx = random.randint(0, len(df)-1)
+        if 'is_flipped' not in st.session_state:
+            st.session_state.is_flipped = False
+
+        # Get current word data
+        row = df.iloc[st.session_state.card_idx]
         
-        {warning && (
-          <div className="mt-4 p-3 bg-amber-50 text-amber-700 rounded-lg flex items-center gap-2 text-sm border border-amber-100">
-             <AlertTriangle className="w-4 h-4" /> {warning}
+        # Determine Front/Back content based on Mode
+        if "Mode A" in mode:
+            front_main = row['word']
+            front_sub = row['ipa']
+            back_main = row['def_cn']
+            back_sub = f"🇬🇧 {row['def_en']}"
+            context = row['source_context']
+        else:
+            front_main = row['def_en']
+            front_sub = "Guess the word?"
+            back_main = row['word']
+            back_sub = row['def_cn']
+            context = row['source_context']
+
+        # CSS Class for flip
+        flip_class = "flipped" if st.session_state.is_flipped else ""
+
+        # HTML Structure for the Card
+        card_html = f"""
+        <div class="flip-card">
+          <div class="flip-card-inner {flip_class}">
+            <div class="flip-card-front">
+              <div class="word-text">{front_main}</div>
+              <div class="def-text">{front_sub}</div>
+            </div>
+            <div class="flip-card-back">
+              <div class="word-text">{back_main}</div>
+              <div class="def-text">{back_sub}</div>
+              {f'<div class="context-text">💡 {context}</div>' if context else ''}
+            </div>
           </div>
-        )}
-
-        {error && (
-            <div className="mt-4 text-red-600 bg-red-50 p-3 rounded-lg text-sm text-center border border-red-100">
-                {error}
-            </div>
-        )}
-      </div>
-
-      {result && (
-        <div className="animate-in fade-in slide-in-from-bottom-6 space-y-6">
-            {/* Status Header */}
-            <div className={`p-4 rounded-xl flex items-center gap-3 border ${result.isCorrect ? 'bg-green-50 border-green-100 text-green-700' : 'bg-amber-50 border-amber-100 text-amber-700'}`}>
-                {result.isCorrect ? <Check className="w-6 h-6" /> : <X className="w-6 h-6" />}
-                <span className="font-semibold text-lg">{result.isCorrect ? 'Great Job!' : 'Needs Improvement'}</span>
-            </div>
-
-            {/* Comparison Cards */}
-            <div className="grid md:grid-cols-2 gap-4">
-                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                    <h4 className="text-xs font-bold text-slate-400 uppercase mb-2">Your Attempt</h4>
-                    <p className="text-slate-800">{result.userSentence}</p>
-                </div>
-                <div className="bg-white p-5 rounded-xl border border-indigo-100 shadow-sm ring-1 ring-indigo-50">
-                    <h4 className="text-xs font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1">
-                        <Sparkles className="w-3 h-3" /> Better Version
-                    </h4>
-                    <p className="text-indigo-900 font-medium">{result.betterVersion}</p>
-                </div>
-            </div>
-
-            {/* Feedback */}
-            <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
-                <h4 className="text-sm font-bold text-slate-700 mb-3 flex items-center gap-2">
-                    <MessageSquare className="w-4 h-4 text-slate-400" /> 
-                    AI Feedback
-                </h4>
-                <p className="text-slate-600 leading-relaxed">{result.feedback}</p>
-                
-                {!result.isCorrect && result.correctedSentence !== result.userSentence && (
-                    <div className="mt-4 pt-4 border-t border-slate-100">
-                        <span className="text-xs text-slate-400 uppercase font-bold">Correction: </span>
-                        <span className="text-slate-700 ml-2">{result.correctedSentence}</span>
-                    </div>
-                )}
-            </div>
         </div>
-      )}
-    </div>
-  );
-};
+        """
+        st.markdown(card_html, unsafe_allow_html=True)
 
-export default Practice;
+        # Control Buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Flip Card", use_container_width=True):
+                st.session_state.is_flipped = not st.session_state.is_flipped
+                st.rerun()
+        with col2:
+            if st.button("➡️ Next Random", use_container_width=True):
+                st.session_state.card_idx = random.randint(0, len(df)-1)
+                st.session_state.is_flipped = False
+                st.rerun()
+
+# --- 页面 3: 造句练习 (直接输入) ---
+elif menu == "✍️ Practice":
+    st.header("Sentence Practice")
+    
+    col_input, col_sent = st.columns([1, 2])
+    
+    with col_input:
+        target_word = st.text_input("Target Word (Type directly)").strip()
+    
+    with col_sent:
+        user_sent = st.text_input("Make a sentence with it")
+
+    if st.button("Check My Sentence"):
+        if not target_word or not user_sent:
+            st.warning("Please fill in both fields.")
+        elif not client:
+            st.error("No API Key found.")
+        else:
+            # Check if word exists in DB to give better context
+            conn = get_db_connection()
+            row = pd.read_sql("SELECT * FROM words WHERE word = ?", co
